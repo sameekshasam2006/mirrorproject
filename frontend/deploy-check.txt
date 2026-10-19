@@ -1,1 +1,1 @@
-Temporary marker for verifying Vercel Git auto-deploy.
+Temporary marker for verifying Vercel Git auto-deploy with a verified Git author.
