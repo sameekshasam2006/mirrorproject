@@ -27,3 +27,4 @@ __pycache__/
 # General
 __pycache__/
 .DS_Store
+.vercel
