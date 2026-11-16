@@ -9,43 +9,66 @@ MIRROR is a digital twin planning platform that helps users understand the impac
 
 ## Quick start
 
-### Backend
+The backend creates `backend/mirror.db` automatically when no database URL is
+configured. After installing the backend and frontend dependencies below, the
+recommended way to start both is from the project root:
 
-```bash
-cd backend
-python -m venv .venv
-. .venv/Scripts/activate
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-copy .env.example .env
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```powershell
+npm run dev
 ```
 
-### Frontend
+This starts the backend first and waits for its `/health` endpoint before
+starting Vite, preventing API proxy requests during backend startup. To run them
+separately instead, use **two PowerShell windows** and start the backend first.
 
-```bash
-cd frontend
+### Backend (PowerShell)
+
+```powershell
+Set-Location backend
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+### Frontend (PowerShell)
+
+```powershell
+Set-Location frontend
 npm install
-cp .env.example .env
-npm run dev -- --host 0.0.0.0
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
+npm run dev
+```
+
+Open `http://localhost:5173`, register an account, and add tasks from the Tasks
+page. The What-If Simulator compares plans without changing saved tasks; approve
+the recommended or selected alternative plan to update the task list and
+calendar. The simulator uses the working hours in user preferences and otherwise
+defaults to 09:00–17:00.
+
+### Tests
+
+```powershell
+Set-Location backend
+.\.venv\Scripts\python.exe -m pytest
+Set-Location ..\frontend
+npm run build
+npm run lint
 ```
 
 ## Environment variables
 
 Update `.env` files with your local settings before running the app.
 
-- The frontend uses `VITE_API_BASE`. For local development, `/api` is proxied
-  to the backend at `http://localhost:8000`; set it to the public backend URL
-  when building for production.
-- The backend uses `APP_ENV`, `SECRET_KEY`, `DATABASE_URL`, and
-  `FRONTEND_ORIGIN`. Production requires a random `SECRET_KEY` of at least 32
-  characters and a persistent PostgreSQL `DATABASE_URL`.
+- The frontend uses `VITE_API_BASE=/api`. Vite proxies `/api` to the local
+  backend at `http://localhost:8000`.
+- The backend uses local SQLite and allows requests from the frontend at
+  `http://localhost:5173`. No deployment configuration is required.
 - Password reset email requires `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`,
-  `SMTP_PASSWORD`, and `SMTP_FROM_EMAIL`. Configure these in the backend host;
-  reset links are not returned by the API.
-- `frontend/vercel.json` enables client-side route fallback. The root
-  `render.yaml` configures a Render web service; its free plan sleeps when idle
-  and has ephemeral disk, so the database must be external and persistent.
+  `SMTP_PASSWORD`, and `SMTP_FROM_EMAIL`. These settings can be left empty for
+  local development; reset links are not returned by the API.
 
 ## Default login
 

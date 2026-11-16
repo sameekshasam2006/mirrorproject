@@ -32,6 +32,66 @@ type Summary = {
   weekly_trend: { week: string; tasks: number }[]
 }
 
+type ScheduledTask = TaskItem & {
+  recommendation_reason?: string
+}
+
+type SimulationAlternative = {
+  id: number
+  title: string
+  proposed_schedule: { tasks: ScheduledTask[]; recommendations?: { task_id: number; reason: string }[] }
+  benefits?: string | null
+  drawbacks?: string | null
+  feasibility_result: string
+}
+
+type SimulationResult = {
+  id: number
+  title: string
+  scenario_type: string
+  status: string
+  feasibility_result: string
+  original_snapshot: { tasks: ScheduledTask[] }
+  proposed_snapshot: { tasks: ScheduledTask[] }
+  impact_analysis: {
+    selected_task: { id: number; title: string }
+    workload_before: number
+    workload_after: number
+    free_time_before: number
+    free_time_after: number
+    pending_tasks_after: number
+    feasible: boolean
+    planning_date: string
+    recommendations: {
+      task_id: number
+      task_name: string
+      date: string
+      start_time: string
+      estimated_duration: number
+      priority: string
+      priority_weight: number
+      reason: string
+    }[]
+    priority_analysis: Record<string, { id: number; title: string; priority_weight: number }[]>
+    conflicts: { task_a: string; task_b: string }[]
+    deadline_risks: { task_name: string; due_date: string }[]
+    overloaded_days: { date: string; scheduled_minutes: number; available_minutes: number }[]
+    warnings: { type: string; message: string }[]
+    postponable_tasks: { id: number; title: string; priority: string }[]
+    tasks_requiring_attention: string[]
+    explanation: string
+  }
+  alternatives: SimulationAlternative[]
+}
+
+type SimulationHistoryItem = {
+  id: number
+  title: string
+  scenario_type: string
+  status: string
+  created_at: string
+}
+
 const defaultTaskForm = {
   title: '',
   description: '',
@@ -830,77 +890,351 @@ function CalendarPage({ auth }: { auth: AuthState }) {
 
 function SimulationPage({ auth }: { auth: AuthState }) {
   const [tasks, setTasks] = useState<TaskItem[]>([])
-  const [simulation, setSimulation] = useState<any>(null)
+  const [simulation, setSimulation] = useState<SimulationResult | null>(null)
+  const [history, setHistory] = useState<SimulationHistoryItem[]>([])
+  const [scenario, setScenario] = useState('skip')
+  const [taskId, setTaskId] = useState('')
+  const [newTime, setNewTime] = useState('')
+  const [newDate, setNewDate] = useState('')
+  const [newDuration, setNewDuration] = useState('90')
+  const [newPriority, setNewPriority] = useState('high')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [selectedAlternative, setSelectedAlternative] = useState<number | null>(null)
 
   useEffect(() => {
-    apiFetch<TaskItem[]>(`/tasks/`, {}, auth.token).then(setTasks).catch(console.error)
+    Promise.all([
+      apiFetch<TaskItem[]>('/tasks/', {}, auth.token),
+      apiFetch<SimulationHistoryItem[]>('/simulations/history', {}, auth.token),
+    ]).then(([taskData, historyData]) => {
+      setTasks(taskData)
+      setTaskId((current) => current || String(taskData.find((task) => task.status !== 'completed')?.id || ''))
+      setHistory(historyData)
+    }).catch((err) => setError(err instanceof Error ? err.message : 'Unable to load simulation data'))
   }, [auth.token])
 
   async function runScenario(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    const form = new FormData(event.currentTarget)
-    const payload = {
-      task_id: Number(form.get('task_id')),
-      scenario_type: String(form.get('scenario_type')),
-      new_priority: form.get('new_priority') ? String(form.get('new_priority')) : undefined,
-      new_duration: form.get('new_duration') ? Number(form.get('new_duration')) : undefined,
+    setLoading(true)
+    setError('')
+    setNotice('')
+    setSelectedAlternative(null)
+    const payload: Record<string, string | number> = {
+      task_id: Number(taskId),
+      scenario_type: scenario,
     }
-    const data = await apiFetch('/simulations/run', { method: 'POST', body: JSON.stringify(payload) }, auth.token)
-    setSimulation(data)
+    if (scenario === 'move') {
+      if (newTime) payload.new_time = new Date(newTime).toISOString()
+      else if (newDate) payload.move_to_date = `${newDate}T00:00:00`
+    }
+    if (scenario === 'extend') payload.new_duration = Number(newDuration)
+    if (scenario === 'priority') payload.new_priority = newPriority
+    try {
+      const data = await apiFetch<SimulationResult>('/simulations/run', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }, auth.token)
+      setSimulation(data)
+      setHistory((previous) => [
+        { id: data.id, title: data.title, scenario_type: data.scenario_type, status: data.status, created_at: new Date().toISOString() },
+        ...previous.filter((item) => item.id !== data.id),
+      ])
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to run simulation')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function approvePlan(alternativeId?: number) {
+    if (!simulation) return
+    setLoading(true)
+    setError('')
+    try {
+      const result = await apiFetch<{ selected_plan: string }>(`/simulations/${simulation.id}/approve`, {
+        method: 'POST',
+        body: JSON.stringify(alternativeId ? { alternative_id: alternativeId } : {}),
+      }, auth.token)
+      setSimulation({ ...simulation, status: 'approved' })
+      setNotice(`${result.selected_plan} approved. Your tasks and calendar have been updated.`)
+      const [taskData, historyData] = await Promise.all([
+        apiFetch<TaskItem[]>('/tasks/', {}, auth.token),
+        apiFetch<SimulationHistoryItem[]>('/simulations/history', {}, auth.token),
+      ])
+      setTasks(taskData)
+      setHistory(historyData)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to approve plan')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function cancelSimulation() {
+    if (!simulation) return
+    setLoading(true)
+    setError('')
+    try {
+      await apiFetch(`/simulations/${simulation.id}/cancel`, { method: 'POST' }, auth.token)
+      setSimulation({ ...simulation, status: 'cancelled' })
+      setNotice('Simulation cancelled. Your actual task schedule was not changed.')
+      setHistory((previous) => previous.map((item) => item.id === simulation.id ? { ...item, status: 'cancelled' } : item))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to cancel simulation')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const impact = simulation?.impact_analysis
+  const formatMinutes = (minutes: number) => `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+  const formatScheduledTime = (value?: string | null) => value
+    ? new Date(value).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+    : 'Not scheduled'
+
+  function planCard(title: string, schedule: ScheduledTask[], accent: boolean) {
+    return (
+      <section className={`rounded-3xl border p-5 ${accent ? 'border-violet-200 bg-violet-50/60' : 'border-slate-200 bg-white'}`}>
+        <div className="mb-4 flex items-center justify-between gap-3">
+          <h3 className="font-semibold text-slate-900">{title}</h3>
+          <span className="text-xs text-slate-500">{schedule.filter((task) => task.status !== 'completed').length} pending</span>
+        </div>
+        <div className="space-y-3">
+          {schedule.filter((task) => task.status !== 'completed').sort((a, b) => (a.start_time || '').localeCompare(b.start_time || '')).map((task) => (
+            <div key={task.id} className="rounded-2xl border border-slate-200/80 bg-white p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="font-medium text-slate-900">{task.title}</div>
+                <span className={`rounded-full px-2.5 py-1 text-xs font-medium capitalize ${
+                  task.priority === 'critical' ? 'bg-red-100 text-red-700'
+                    : task.priority === 'high' ? 'bg-orange-100 text-orange-700'
+                      : task.priority === 'medium' ? 'bg-blue-100 text-blue-700'
+                        : 'bg-slate-100 text-slate-600'
+                }`}>{task.priority}</span>
+              </div>
+              <div className="mt-1 text-xs text-slate-500">{formatScheduledTime(task.start_time)} · {task.estimated_duration} min · {task.status.replace('_', ' ')}</div>
+              {task.recommendation_reason && <p className="mt-2 text-xs leading-5 text-slate-600">{task.recommendation_reason}</p>}
+            </div>
+          ))}
+          {!schedule.some((task) => task.status !== 'completed') && <p className="text-sm text-slate-500">No pending tasks in this plan.</p>}
+        </div>
+      </section>
+    )
   }
 
   return (
     <AppShell auth={auth} title="What-If Simulator">
-      <div className="grid gap-6 lg:grid-cols-[0.85fr_1.15fr]">
-        <form onSubmit={runScenario} className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
-          <h3 className="text-xl font-semibold text-slate-900">Scenario test</h3>
-          <div className="mt-5 space-y-4">
-            <select name="task_id" className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3" required>
-              {tasks.map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}
-            </select>
-            <select name="scenario_type" className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3" required>
-              <option value="postpone">Postpone</option>
-              <option value="skip">Skip</option>
-              <option value="move">Move</option>
-              <option value="extend">Extend duration</option>
-              <option value="priority">Change priority</option>
-            </select>
-            <input name="new_duration" type="number" min={15} max={480} placeholder="New duration (minutes)" className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3" />
-            <select name="new_priority" className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-              <option value="">No priority change</option>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-              <option value="critical">Critical</option>
-            </select>
-            <button type="submit" className="w-full rounded-full bg-slate-900 px-6 py-3 font-medium text-white">Run simulation</button>
-          </div>
-        </form>
-
-        <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
-          <h3 className="text-xl font-semibold text-slate-900">Impact analysis</h3>
-          {simulation ? (
+      <div className="space-y-6">
+        <div className="grid grid-cols-1 gap-6 xl:grid-cols-[360px_minmax(0,1fr)]">
+          <form onSubmit={runScenario} className="h-fit min-w-0 rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+            <div className="text-xs font-semibold uppercase tracking-[0.18em] text-violet-700">Decision lab</div>
+            <h2 className="mt-2 text-xl font-semibold text-slate-900">Model a schedule change</h2>
+            <p className="mt-2 text-sm leading-6 text-slate-500">Compare a proposed plan against your saved schedule. Nothing changes until you approve.</p>
             <div className="mt-5 space-y-4">
-              <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4">
-                <div className="text-sm text-violet-700">Feasibility</div>
-                <div className="mt-2 text-xl font-semibold text-slate-900">{simulation.feasibility_result}</div>
-              </div>
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                  <div className="text-sm text-slate-500">Workload before</div>
-                  <div className="text-2xl font-semibold text-slate-900">{simulation.impact_analysis.workload_before}</div>
+              <label className="block text-sm font-medium text-slate-700">Task
+                <select value={taskId} onChange={(event) => setTaskId(event.target.value)} className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3" required>
+                  {tasks.filter((task) => task.status !== 'completed').map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}
+                </select>
+              </label>
+              <label className="block text-sm font-medium text-slate-700">What would you like to change?
+                <select value={scenario} onChange={(event) => setScenario(event.target.value)} className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                  <option value="skip">Skip this task today</option>
+                  <option value="postpone">Postpone this task</option>
+                  <option value="move">Move to another date or time</option>
+                  <option value="extend">Extend task duration</option>
+                  <option value="priority">Change task priority</option>
+                </select>
+              </label>
+              {scenario === 'move' && (
+                <div className="space-y-3">
+                  <label className="block text-sm font-medium text-slate-700">Specific time (optional)
+                    <input type="datetime-local" value={newTime} onChange={(event) => { setNewTime(event.target.value); setNewDate('') }} className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3" />
+                  </label>
+                  <label className="block text-sm font-medium text-slate-700">Or choose a date
+                    <input type="date" value={newDate} onChange={(event) => { setNewDate(event.target.value); setNewTime('') }} className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3" />
+                  </label>
                 </div>
-                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                  <div className="text-sm text-slate-500">Workload after</div>
-                  <div className="text-2xl font-semibold text-slate-900">{simulation.impact_analysis.workload_after}</div>
+              )}
+              {scenario === 'extend' && (
+                <label className="block text-sm font-medium text-slate-700">New duration (minutes)
+                  <input type="number" value={newDuration} min={15} max={480} onChange={(event) => setNewDuration(event.target.value)} className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3" required />
+                </label>
+              )}
+              {scenario === 'priority' && (
+                <label className="block text-sm font-medium text-slate-700">New priority
+                  <select value={newPriority} onChange={(event) => setNewPriority(event.target.value)} className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+                    <option value="low">Low · 1</option>
+                    <option value="medium">Medium · 2</option>
+                    <option value="high">High · 3</option>
+                    <option value="critical">Critical · 4</option>
+                  </select>
+                </label>
+              )}
+              {error && <p role="alert" className="rounded-2xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
+              <button type="submit" disabled={loading || !tasks.some((task) => task.status !== 'completed')} className="w-full rounded-full bg-slate-900 px-6 py-3 font-medium text-white disabled:cursor-not-allowed disabled:opacity-60">
+                {loading ? 'Planning your schedule…' : 'Run simulation'}
+              </button>
+            </div>
+            {history.length > 0 && (
+              <div className="mt-7 border-t border-slate-100 pt-5">
+                <h3 className="text-sm font-semibold text-slate-800">Recent simulations</h3>
+                <div className="mt-3 space-y-2">
+                  {history.slice(0, 4).map((item) => (
+                    <div key={item.id} className="flex items-center justify-between gap-2 text-xs">
+                      <span className="truncate text-slate-600">{item.title}</span>
+                      <span className="shrink-0 rounded-full bg-slate-100 px-2 py-1 capitalize text-slate-600">{item.status}</span>
+                    </div>
+                  ))}
                 </div>
               </div>
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
-                {simulation.impact_analysis.explanation}
+            )}
+          </form>
+
+          {simulation && impact ? (
+            <div className="space-y-5">
+              <section className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div>
+                    <div className="text-xs font-semibold uppercase tracking-[0.18em] text-violet-700">Simulation summary</div>
+                    <h2 className="mt-2 text-2xl font-semibold text-slate-900">{impact.selected_task.title}</h2>
+                    <p className="mt-1 text-sm text-slate-500">Scenario: <span className="capitalize">{simulation.scenario_type}</span> · Planned from {impact.planning_date}</p>
+                  </div>
+                  <div className="flex gap-2">
+                    <span className={`rounded-full px-3 py-1.5 text-xs font-semibold capitalize ${impact.feasible ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-800'}`}>{impact.feasible ? 'Feasible plan' : 'Review trade-offs'}</span>
+                    <span className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-semibold capitalize text-slate-600">{simulation.status}</span>
+                  </div>
+                </div>
+                {notice && <p role="status" className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{notice}</p>}
+                <p className="mt-4 text-sm leading-6 text-slate-600">{impact.explanation}</p>
+                <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  {[
+                    ['Original workload', formatMinutes(impact.workload_before)],
+                    ['Revised workload', formatMinutes(impact.workload_after)],
+                    ['Free working time', formatMinutes(impact.free_time_after)],
+                    ['Pending tasks', String(impact.pending_tasks_after)],
+                  ].map(([label, value]) => (
+                    <div key={label} className="rounded-2xl bg-slate-50 p-4">
+                      <div className="text-xs text-slate-500">{label}</div>
+                      <div className="mt-1 text-xl font-semibold text-slate-900">{value}</div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              <div className="grid gap-4 xl:grid-cols-2">
+                {planCard('Original schedule', simulation.original_snapshot.tasks, false)}
+                {planCard('Recommended schedule', simulation.proposed_snapshot.tasks, true)}
+              </div>
+
+              <section className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-lg font-semibold text-slate-900">Recommended timetable</h3>
+                    <p className="mt-1 text-sm text-slate-500">Suggested times are based on working hours, saved commitments, deadlines, and priority weights.</p>
+                  </div>
+                  <div className="text-xs text-slate-500">Priority weights: Critical 4 · High 3 · Medium 2 · Low 1</div>
+                </div>
+                {impact.recommendations.length ? (
+                  <div className="mt-4 overflow-x-auto">
+                    <table className="w-full min-w-[640px] text-left text-sm">
+                      <thead className="text-xs uppercase tracking-wide text-slate-500"><tr><th className="pb-3 pr-4">Date / time</th><th className="pb-3 pr-4">Task</th><th className="pb-3 pr-4">Duration</th><th className="pb-3 pr-4">Priority</th><th className="pb-3">Why this slot</th></tr></thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {impact.recommendations.map((item) => (
+                          <tr key={item.task_id}>
+                            <td className="py-3 pr-4 whitespace-nowrap">{formatScheduledTime(item.start_time)}</td>
+                            <td className="py-3 pr-4 font-medium text-slate-900">{item.task_name}</td>
+                            <td className="py-3 pr-4">{item.estimated_duration} min</td>
+                            <td className="py-3 pr-4 capitalize">{item.priority} · {item.priority_weight}</td>
+                            <td className="py-3 text-slate-600">{item.reason}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : <p className="mt-4 text-sm text-slate-500">The plan preserves the existing schedule; no new task slots were needed.</p>}
+              </section>
+
+              <div className="grid gap-4 xl:grid-cols-[0.85fr_1.15fr]">
+                <section className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+                  <h3 className="text-lg font-semibold text-slate-900">Priority analysis</h3>
+                  <div className="mt-4 space-y-3">
+                    {['critical', 'high', 'medium', 'low'].map((priority) => (
+                      <div key={priority} className="rounded-2xl bg-slate-50 p-3">
+                        <div className="flex justify-between text-sm font-semibold capitalize text-slate-800"><span>{priority} · {({ critical: 4, high: 3, medium: 2, low: 1 } as Record<string, number>)[priority]}</span><span>{impact.priority_analysis[priority]?.length || 0}</span></div>
+                        <div className="mt-1 text-xs text-slate-500">{impact.priority_analysis[priority]?.map((task) => task.title).join(', ') || 'No tasks'}</div>
+                      </div>
+                    ))}
+                    <div className="border-t border-slate-100 pt-3">
+                      <div className="text-sm font-semibold text-slate-800">Can be postponed</div>
+                      <p className="mt-1 text-xs text-slate-500">{impact.postponable_tasks.map((task) => task.title).join(', ') || 'No low- or medium-priority tasks are clear postponement candidates.'}</p>
+                    </div>
+                  </div>
+                </section>
+                <section className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+                  <h3 className="text-lg font-semibold text-slate-900">Warnings & attention</h3>
+                  {impact.warnings.length ? (
+                    <div className="mt-4 space-y-2">
+                      {impact.warnings.map((warning, index) => (
+                        <div key={`${warning.type}-${index}`} className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">{warning.message}</div>
+                      ))}
+                    </div>
+                  ) : <p className="mt-3 rounded-2xl bg-emerald-50 px-4 py-3 text-sm text-emerald-800">No overlaps, deadline risks, or overloaded days were found.</p>}
+                  <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-2xl bg-slate-50 p-3 text-sm"><div className="font-medium text-slate-800">Conflicts</div><div className="mt-1 text-slate-500">{impact.conflicts.length}</div></div>
+                    <div className="rounded-2xl bg-slate-50 p-3 text-sm"><div className="font-medium text-slate-800">Deadline risks</div><div className="mt-1 text-slate-500">{impact.deadline_risks.length}</div></div>
+                  </div>
+                </section>
+              </div>
+
+              <section className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+                <div>
+                  <h3 className="text-lg font-semibold text-slate-900">Alternative plans</h3>
+                  <p className="mt-1 text-sm text-slate-500">Compare deadline-first and balanced-priority approaches before applying a plan.</p>
+                </div>
+                <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                  {simulation.alternatives.map((alternative) => (
+                    <article key={alternative.id} className={`rounded-2xl border p-4 ${selectedAlternative === alternative.id ? 'border-violet-400 bg-violet-50' : 'border-slate-200 bg-white'}`}>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h4 className="font-semibold text-slate-900">{alternative.title}</h4>
+                        <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs capitalize text-slate-600">{alternative.feasibility_result}</span>
+                      </div>
+                      <p className="mt-3 text-sm text-emerald-800"><span className="font-medium">Benefit:</span> {alternative.benefits}</p>
+                      <p className="mt-2 text-sm text-amber-800"><span className="font-medium">Trade-off:</span> {alternative.drawbacks}</p>
+                      <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
+                        {alternative.proposed_schedule.tasks
+                          .filter((task) => task.status !== 'completed')
+                          .sort((a, b) => (a.start_time || '').localeCompare(b.start_time || ''))
+                          .slice(0, 3)
+                          .map((task) => (
+                            <div key={task.id} className="flex flex-wrap justify-between gap-2 text-xs">
+                              <span className="font-medium text-slate-800">{task.title}</span>
+                              <span className="text-slate-500">{formatScheduledTime(task.start_time)} · {task.estimated_duration}m · {task.priority}</span>
+                            </div>
+                          ))}
+                        {alternative.proposed_schedule.tasks.filter((task) => task.status !== 'completed').length > 3 && (
+                          <div className="text-xs text-slate-500">+{alternative.proposed_schedule.tasks.filter((task) => task.status !== 'completed').length - 3} more tasks</div>
+                        )}
+                      </div>
+                      <button type="button" onClick={() => setSelectedAlternative(alternative.id)} disabled={simulation.status !== 'draft'} className="mt-4 rounded-full border border-violet-200 px-4 py-2 text-sm font-medium text-violet-800 disabled:opacity-50">{selectedAlternative === alternative.id ? 'Alternative selected' : 'Select alternative'}</button>
+                    </article>
+                  ))}
+                </div>
+              </section>
+
+              <div className="flex flex-wrap justify-end gap-3 rounded-[28px] border border-slate-200 bg-white p-5 shadow-sm">
+                <button type="button" disabled={loading || simulation.status !== 'draft'} onClick={cancelSimulation} className="rounded-full border border-slate-200 px-5 py-2.5 text-sm font-medium text-slate-700 disabled:opacity-50">Cancel simulation</button>
+                <button type="button" disabled={loading || simulation.status !== 'draft'} onClick={() => approvePlan(selectedAlternative || undefined)} className="rounded-full bg-slate-900 px-5 py-2.5 text-sm font-medium text-white disabled:opacity-50">
+                  {loading ? 'Saving…' : selectedAlternative ? 'Approve selected alternative' : 'Approve recommended plan'}
+                </button>
               </div>
             </div>
           ) : (
-            <div className="mt-5 rounded-2xl border border-dashed border-slate-300 p-12 text-center text-slate-500">No simulation yet. Choose an existing task and test a scenario.</div>
+            <div className="flex min-h-[360px] flex-col items-center justify-center rounded-[28px] border border-dashed border-slate-300 bg-white p-10 text-center">
+              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-violet-50 text-2xl text-violet-700">↗</div>
+              <h2 className="mt-4 text-xl font-semibold text-slate-900">Your schedule, before and after</h2>
+              <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">Choose a task and scenario to see workload, recommended time slots, deadline risks, and alternative plans.</p>
+              {error && <p role="alert" className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">{error}</p>}
+            </div>
           )}
         </div>
       </div>

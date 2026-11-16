@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 
 class UserCreate(BaseModel):
@@ -104,11 +104,34 @@ class TaskOut(TaskBase):
 
 class SimulationInput(BaseModel):
     task_id: int
-    scenario_type: str = Field(...)
+    scenario_type: Literal["skip", "postpone", "move", "extend", "priority"]
     new_time: datetime | None = None
     new_duration: int | None = Field(default=None, ge=15, le=480)
     new_priority: str | None = None
     move_to_date: datetime | None = None
+
+    @field_validator("new_priority")
+    @classmethod
+    def validate_new_priority(cls, value: str | None):
+        if value is not None and value.lower() not in {"low", "medium", "high", "critical"}:
+            raise ValueError("Priority must be low, medium, high, or critical")
+        return value.lower() if value is not None else None
+
+    @model_validator(mode="after")
+    def validate_scenario_parameters(self):
+        if self.scenario_type == "move" and self.new_time is None and self.move_to_date is None:
+            raise ValueError("Move requires a new time or date")
+        if self.scenario_type == "move" and self.new_time is not None and self.move_to_date is not None:
+            raise ValueError("Provide either a new time or a new date, not both")
+        if self.scenario_type == "extend" and self.new_duration is None:
+            raise ValueError("Extend requires a new duration")
+        if self.scenario_type == "priority" and self.new_priority is None:
+            raise ValueError("Priority change requires a new priority")
+        return self
+
+
+class SimulationApprovalInput(BaseModel):
+    alternative_id: int | None = None
 
 
 class SimulationAlternativeOut(BaseModel):
@@ -136,7 +159,7 @@ class SimulationOut(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
-    alternatives: list[SimulationAlternativeOut] = []
+    alternatives: list[SimulationAlternativeOut] = Field(default_factory=list)
 
 
 class NotificationOut(BaseModel):

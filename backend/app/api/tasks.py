@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
@@ -10,6 +10,12 @@ from app.models.models import Task, User
 from app.schemas.schemas import TaskCreate, TaskOut, TaskUpdate
 
 router = APIRouter()
+
+
+def _naive_utc(value: datetime | None) -> datetime | None:
+    if value is not None and value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 @router.get("/", response_model=list[TaskOut])
@@ -39,12 +45,18 @@ def list_tasks(
 
 @router.post("/", response_model=TaskOut, status_code=status.HTTP_201_CREATED)
 def create_task(payload: TaskCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
-    if payload.due_date and payload.start_time and payload.due_date < payload.start_time:
+    start_time = _naive_utc(payload.start_time)
+    due_date = _naive_utc(payload.due_date)
+    if due_date and start_time and due_date < start_time:
         raise HTTPException(status_code=400, detail="Due date cannot be before start time")
 
-    task = Task(user_id=current_user.id, **payload.model_dump())
+    task = Task(user_id=current_user.id, **payload.model_dump(exclude={"start_time", "due_date"}), start_time=start_time, due_date=due_date)
     db.add(task)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(task)
     return task
 
@@ -64,10 +76,17 @@ def update_task(task_id: int, payload: TaskUpdate, db: Session = Depends(get_db)
         raise HTTPException(status_code=404, detail="Task not found")
     for field, value in payload.model_dump(exclude_unset=True).items():
         if value is not None:
+            if field in {"start_time", "due_date"}:
+                value = _naive_utc(value)
             setattr(task, field, value)
     if task.due_date and task.start_time and task.due_date < task.start_time:
+        db.rollback()
         raise HTTPException(status_code=400, detail="Due date cannot be before start time")
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(task)
     return task
 
@@ -78,4 +97,8 @@ def delete_task(task_id: int, db: Session = Depends(get_db), current_user: User 
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     db.delete(task)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
